@@ -1,14 +1,12 @@
 # Mini TCP/HTTP Server in Go
 
+Схема проекта:
+
 ```text
 TCP -> HTTP -> Router -> Handler -> HTTP Response -> TCP
 ```
 
-Без `net/http`: TCP-соединения и HTTP-запросы разбираются вручную.
-
----
-
-## Структура проекта
+## Структура
 
 ```text
 mini-http/
@@ -16,21 +14,17 @@ mini-http/
 └── README.md
 ```
 
----
-
 ## 1. Запуск сервера
 
 ```bash
 go run server.go
 ```
 
-Сервер начинает слушать:
+Сервер слушает:
 
 ```text
 127.0.0.1:8080
 ```
-
-В коде:
 
 ```go
 listener, err := net.Listen("tcp", "127.0.0.1:8080")
@@ -39,87 +33,94 @@ listener, err := net.Listen("tcp", "127.0.0.1:8080")
 Схема:
 
 ```text
-                server.go
-                    |
-                    v
-             net.Listen(...)
-                    |
-                    v
-          TCP listening socket
-                    |
-                    v
-              127.0.0.1:8080
-```
-
-`listener` пока не является соединением с конкретным пользователем.
-
-Он только ждёт новые TCP-соединения.
-
----
-
-## 2. Подключается пользователь A
-
-Пользователь A открывает:
-
-```text
-http://127.0.0.1:8080/
-```
-
-Браузер создаёт TCP-соединение с сервером:
-
-```text
-User A / Firefox
-       |
-       | TCP connect
-       v
+server.go
+   |
+   v
+net.Listen(...)
+   |
+   v
+TCP listening socket
+   |
+   v
 127.0.0.1:8080
-       |
-       v
-listener.Accept()
-       |
-       v
-     conn A
 ```
 
-Сервер получает конкретное соединение:
+`listener` принимает новые TCP-соединения:
 
 ```go
 conn, err := listener.Accept()
 ```
 
-`conn` теперь представляет TCP-соединение с пользователем A.
+---
+
+## 2. Подключение пользователя
+
+Пользователь открывает:
+
+```text
+http://127.0.0.1:8080/users
+```
+
+Браузер создаёт TCP-соединение:
+
+```text
+User / Browser
+      |
+      | TCP connect
+      v
+127.0.0.1:8080
+      |
+      v
+listener.Accept()
+      |
+      v
+    conn
+```
+
+`conn` — TCP-соединение с конкретным клиентом.
 
 ---
 
-## 3. Пользователь A отправляет HTTP-запрос
+## 3. HTTP внутри TCP
 
-Firefox формирует HTTP-запрос примерно такого вида:
+Браузер формирует HTTP-запрос:
 
 ```http
-GET / HTTP/1.1
+GET /users HTTP/1.1
 Host: 127.0.0.1:8080
 User-Agent: Mozilla/5.0 ...
 Accept: text/html
 Connection: keep-alive
 ```
 
-HTTP здесь — просто данные внутри TCP.
+HTTP передаётся через TCP как последовательность байтов:
 
 ```text
-User A
-  |
-  | TCP connection A
-  |
-  | bytes:
-  |
-  | GET / HTTP/1.1
-  | Host: ...
-  | Accept: ...
-  v
-server
+Browser
+   |
+   | TCP connection
+   |
+   | bytes
+   v
+Server
 ```
 
-Сервер читает эти байты:
+TCP не знает про:
+
+```text
+GET
+POST
+/users
+headers
+JSON
+status codes
+```
+
+Для TCP это только поток байтов.
+
+---
+
+## 4. Чтение данных
 
 ```go
 buffer := make([]byte, 4096)
@@ -127,47 +128,48 @@ buffer := make([]byte, 4096)
 n, err := conn.Read(buffer)
 ```
 
-Например начало `buffer` может выглядеть так:
+`buffer` — массив байтов.
+
+Например начало запроса:
 
 ```text
-index       byte        symbol
+index       byte       symbol
 
-buffer[0]    71           G
-buffer[1]    69           E
-buffer[2]    84           T
-buffer[3]    32          space
-buffer[4]    47           /
+buffer[0]    71          G
+buffer[1]    69          E
+buffer[2]    84          T
+buffer[3]    32        space
+buffer[4]    47          /
 ```
 
-После:
+`n` — количество байтов, реально прочитанных этим вызовом `Read`.
 
 ```go
 data := string(buffer[:n])
 ```
 
-получаем строку:
+Преобразует полученные байты в строку:
 
 ```text
-GET / HTTP/1.1
+GET /users HTTP/1.1
 Host: 127.0.0.1:8080
 ...
 ```
 
 ---
 
-## 4. HTTP parser
+## 5. Разбор HTTP request line
 
-Первая строка запроса:
+Первая строка:
 
 ```text
-GET / HTTP/1.1
+GET /users HTTP/1.1
 ```
 
-Мы разбираем её:
+Разбор:
 
 ```go
 firstLine := strings.Split(data, "\r\n")[0]
-
 parts := strings.Split(firstLine, " ")
 
 method := parts[0]
@@ -175,19 +177,17 @@ path := parts[1]
 protocol := parts[2]
 ```
 
-Получаем:
+Результат:
 
 ```text
 method   = GET
-path     = /
+path     = /users
 protocol = HTTP/1.1
 ```
 
 ---
 
-## 5. Router
-
-Наш router:
+## 6. Router
 
 ```go
 routes := map[string]func() string{
@@ -196,33 +196,19 @@ routes := map[string]func() string{
 }
 ```
 
-Для запроса:
-
-```text
-GET /users HTTP/1.1
-```
-
-получаем:
+По `path` выбирается handler:
 
 ```go
-handler, exists := routes["/users"]
+handler, exists := routes[path]
 ```
 
-и вызываем:
-
-```go
-body := handler()
-```
-
-То есть:
+Схема:
 
 ```text
-HTTP request
-
 GET /users HTTP/1.1
         |
         v
-   path="/users"
+ path = "/users"
         |
         v
       router
@@ -232,16 +218,11 @@ GET /users HTTP/1.1
         |
         v
      users()
-        |
-        v
-  "users page"
 ```
 
 ---
 
-## 6. HTTP response
-
-Handler возвращает данные:
+## 7. Handler
 
 ```go
 func users() string {
@@ -249,7 +230,20 @@ func users() string {
 }
 ```
 
-Сервер формирует HTTP response:
+Handler возвращает данные для ответа:
+
+```text
+users()
+   |
+   v
+"users page"
+```
+
+---
+
+## 8. HTTP response
+
+Сервер формирует ответ:
 
 ```http
 HTTP/1.1 200 OK
@@ -260,7 +254,7 @@ Connection: close
 users page
 ```
 
-И отправляет его через то же TCP-соединение:
+Отправка:
 
 ```go
 conn.Write([]byte(response))
@@ -269,13 +263,10 @@ conn.Write([]byte(response))
 Схема:
 
 ```text
-users()
+handler
    |
    v
-"users page"
-   |
-   v
-HTTP response
+response string
    |
    v
 []byte
@@ -283,33 +274,29 @@ HTTP response
    v
 conn.Write(...)
    |
-   | TCP connection A
+   | TCP
    v
-Firefox
+Browser
 ```
 
 ---
 
 # Два пользователя
 
-Теперь пусть есть два пользователя.
+Пользователи подключаются в разное время и выполняют действия последовательно.
 
-Они пришли не одновременно.
+## Пользователь A
 
-## Шаг 1 — пользователь A
-
-В 12:00 пользователь A открывает:
+Открывает:
 
 ```text
 /
 ```
 
-Происходит:
-
 ```text
 User A
   |
-  | TCP connection A
+  | TCP A
   v
 Accept()
   |
@@ -324,32 +311,25 @@ home()
   |
   v
 200 OK
-```
-
-После ответа наш учебный сервер делает:
-
-```go
+  |
+  v
 conn.Close()
 ```
 
-TCP connection A закрыт.
-
 ---
 
-## Шаг 2 — пользователь B
+## Пользователь B
 
-Через несколько секунд пользователь B открывает:
+После этого пользователь B открывает:
 
 ```text
 /users
 ```
 
-Создаётся уже другое TCP-соединение:
-
 ```text
 User B
   |
-  | TCP connection B
+  | TCP B
   v
 Accept()
   |
@@ -364,32 +344,22 @@ users()
   |
   v
 200 OK
+  |
+  v
+conn.Close()
 ```
 
 ---
 
-## Шаг 3 — пользователь A делает ещё одно действие
+## Пользователь A делает ещё один запрос
 
-Теперь пользователь A нажимает ссылку:
+Позже пользователь A открывает:
 
 ```text
 /users
 ```
 
-Если предыдущее соединение было закрыто, браузер создаёт новое:
-
-```text
-User A
-  |
-  | TCP connection C
-  v
-Accept()
-  |
-  v
-GET /users
-```
-
-То есть один пользователь не обязательно равен одному TCP connection.
+Если предыдущее TCP-соединение было закрыто, создаётся новое:
 
 ```text
 User A
@@ -397,47 +367,52 @@ User A
    +---- TCP A ---- GET /
    |
    +---- TCP C ---- GET /users
-```
 
-А другой пользователь:
-
-```text
 User B
    |
    +---- TCP B ---- GET /users
 ```
 
+Один пользователь не равен одному TCP-соединению.
+
 ---
 
-# Последовательная работа нашего сервера
+# Последовательная обработка
 
-Сейчас сервер однопоточный:
+При таком коде:
 
 ```go
 for {
     conn, _ := listener.Accept()
 
-    // обработка запроса
+    // read
+    // parse HTTP
+    // route
+    // handler
+    // response
 
     conn.Close()
 }
 ```
 
-Поэтому порядок примерно такой:
+сервер обрабатывает соединения последовательно.
 
 ```text
-time ---------------------------------------------------->
+time ------------------------------------------------------>
 
 User A:
     connect
        |
-       +------ GET / ------+
-                         response
+       +------ request A ------+
+                               |
+                            response
 
 Server:
     Accept A
        |
        read
+       |
+       parse
        |
        route
        |
@@ -446,359 +421,231 @@ Server:
        response
        |
        close A
-                         |
-                         +---- Accept B
+                               |
+                               +---- Accept B
 
 User B:
-                         connect
-                            |
-                            +---- GET /users ----+
-                                             response
+                               connect
+                                  |
+                                  +---- request B ----+
 ```
 
-Пока сервер обрабатывает A, следующий connection может ждать в очереди TCP.
-
-После завершения A сервер снова вызывает:
-
-```go
-listener.Accept()
-```
-
-и получает следующий connection.
+Следующее TCP-соединение может ждать в очереди, пока сервер занят текущим.
 
 ---
 
-# Где TCP, а где HTTP
-
-```text
-+---------------------------------------------------+
-|                    APPLICATION                    |
-|                                                   |
-|     Router -> Handler -> Application logic        |
-+---------------------------------------------------+
-
-                        ^
-                        |
-                    HTTP request
-                    HTTP response
-                        |
-                        v
-
-+---------------------------------------------------+
-|                       HTTP                        |
-|                                                   |
-|   GET /users HTTP/1.1                             |
-|   Host: ...                                       |
-|   Content-Length: ...                             |
-|                                                   |
-|   HTTP/1.1 200 OK                                 |
-|   Content-Type: ...                               |
-+---------------------------------------------------+
-
-                        ^
-                        |
-                  stream of bytes
-                        |
-                        v
-
-+---------------------------------------------------+
-|                       TCP                         |
-|                                                   |
-|     connection A                                  |
-|     connection B                                  |
-|     connection C                                  |
-+---------------------------------------------------+
-
-                        ^
-                        |
-                        v
-
-                    Operating System
-```
-
-TCP не знает ничего про:
-
-```text
-GET
-POST
-/users
-headers
-JSON
-HTTP status
-```
-
-Для TCP всё это просто байты.
-
----
-
-# Что если POST больше 4096 байт?
-
-Вот это:
+# POST больше 4096 байт
 
 ```go
 buffer := make([]byte, 4096)
-
-n, err := conn.Read(buffer)
 ```
 
-означает:
+`4096` — размер одного буфера чтения.
 
-> прочитать максимум 4096 байт за один вызов `Read`.
-
-Это НЕ означает:
-
-> весь HTTP request обязательно поместится в 4096 байт.
-
-Например клиент отправляет:
-
-```http
-POST /users HTTP/1.1
-Content-Length: 10000
-
-<10000 bytes>
-```
-
-TCP может доставить данные частями:
-
-```text
-HTTP request = 10000+ bytes
-
-TCP stream:
-
-[ chunk 1 ]
-4096 bytes
-
-[ chunk 2 ]
-4096 bytes
-
-[ chunk 3 ]
-remaining bytes
-```
-
-Тогда сервер должен читать несколько раз:
-
-```text
-conn.Read()
-    |
-    +---- 4096 bytes
-
-conn.Read()
-    |
-    +---- 4096 bytes
-
-conn.Read()
-    |
-    +---- remaining bytes
-```
-
----
-
-## Важный момент
-
-Нельзя считать, что:
-
-```go
-conn.Read(buffer)
-```
-
-вернёт ровно 4096 байт.
-
-Он может вернуть:
-
-```text
-120 bytes
-700 bytes
-4096 bytes
-38 bytes
-...
-```
-
-TCP — поток байтов.
-
-Границы одного `Read()` не совпадают с границами HTTP request.
-
----
-
-# Как понять, сколько читать
-
-Для обычного HTTP request сначала читаются headers.
-
-Они заканчиваются:
-
-```text
-\r\n\r\n
-```
+Он не ограничивает размер HTTP-запроса.
 
 Например:
 
 ```http
 POST /users HTTP/1.1
-Host: localhost
-Content-Type: application/json
-Content-Length: 18
+Content-Length: 10000
 
-{"name":"Alice"}
+<10000 bytes body>
 ```
 
-После headers сервер видит:
+Данные могут быть прочитаны частями:
 
 ```text
-Content-Length: 18
+TCP stream
+
+[ 4096 bytes ]
+       |
+       v
+    Read #1
+
+[ 4096 bytes ]
+       |
+       v
+    Read #2
+
+[ remaining bytes ]
+       |
+       v
+    Read #3
 ```
 
-Это означает:
+Один `Read()` может вернуть любое количество доступных байтов:
 
-> после headers нужно получить ещё 18 байт body.
+```text
+120
+700
+4096
+38
+...
+```
+
+Границы `Read()` не совпадают с границами HTTP-запроса.
+
+---
+
+# Чтение полного HTTP-запроса
+
+Сначала нужно найти конец headers:
+
+```text
+\r\n\r\n
+```
+
+Пример:
+
+```http
+POST /users HTTP/1.1
+Host: localhost
+Content-Type: application/json
+Content-Length: 16
+
+{"name":"Alex"}
+```
 
 Схема:
 
 ```text
-TCP stream
-    |
-    v
-
 POST /users HTTP/1.1\r\n
 Host: localhost\r\n
-Content-Length: 18\r\n
+Content-Type: application/json\r\n
+Content-Length: 16\r\n
 \r\n
-{"name":"Alice"}
-^
-|
-headers
-                ^
-                |
-             body
+{"name":"Alex"}
+|-----------------------------------------------|
+                    headers
+
+                                                |--------------|
+                                                      body
 ```
 
-Алгоритм примерно такой:
+Алгоритм:
 
 ```text
 1. Читать TCP
         |
         v
-2. Найти \r\n\r\n
+2. Накапливать bytes
         |
         v
-3. Распарсить headers
+3. Найти \r\n\r\n
         |
         v
-4. Найти Content-Length
+4. Распарсить headers
         |
         v
-5. Читать, пока не получено всё body
+5. Прочитать Content-Length
         |
         v
-6. Передать request router'у
+6. Дочитать body до нужной длины
+        |
+        v
+7. Передать request router'у
 ```
-
-Именно поэтому настоящий HTTP-сервер намного сложнее нашего учебного примера.
 
 ---
 
-# Общая схема проекта
+# Общая схема
 
 ```text
-                         INTERNET / CLIENTS
-
-                User A                     User B
-               Firefox                    Firefox
-                  |                          |
-                  | TCP                      | TCP
-                  |                          |
-                  +------------+-------------+
-                               |
-                               v
-                    +---------------------+
-                    |    TCP LISTENER     |
-                    |   127.0.0.1:8080    |
-                    +---------------------+
-                               |
+                   USER A                 USER B
+                  Browser                Browser
+                     |                      |
+                     | TCP                  | TCP
+                     |                      |
+                     +----------+-----------+
+                                |
+                                v
+                     +--------------------+
+                     |   TCP LISTENER     |
+                     |  127.0.0.1:8080    |
+                     +--------------------+
+                                |
                          listener.Accept()
-                               |
-                               v
-                    +---------------------+
-                    |   TCP CONNECTION    |
-                    |       conn          |
-                    +---------------------+
-                               |
-                          conn.Read()
-                               |
-                               v
-                    +---------------------+
-                    |     RAW BYTES       |
-                    +---------------------+
-                               |
-                               v
-                    +---------------------+
-                    |    HTTP PARSER      |
-                    |                     |
-                    | method = GET        |
-                    | path = /users       |
-                    +---------------------+
-                               |
-                               v
-                    +---------------------+
-                    |       ROUTER        |
-                    |                     |
-                    | "/"      -> home    |
-                    | "/users" -> users   |
-                    +---------------------+
-                               |
-                               v
-                    +---------------------+
-                    |       HANDLER       |
-                    |      users()        |
-                    +---------------------+
-                               |
-                               v
-                    +---------------------+
-                    |    HTTP RESPONSE    |
-                    |     200 OK          |
-                    +---------------------+
-                               |
-                          conn.Write()
-                               |
-                               v
-                         TCP connection
-                               |
-                               v
-                            Browser
+                                |
+                                v
+                     +--------------------+
+                     | TCP CONNECTION     |
+                     |       conn         |
+                     +--------------------+
+                                |
+                           conn.Read()
+                                |
+                                v
+                     +--------------------+
+                     |     RAW BYTES      |
+                     +--------------------+
+                                |
+                                v
+                     +--------------------+
+                     |    HTTP PARSER     |
+                     |                    |
+                     | method = GET       |
+                     | path = /users      |
+                     +--------------------+
+                                |
+                                v
+                     +--------------------+
+                     |      ROUTER        |
+                     |                    |
+                     | "/"      -> home   |
+                     | "/users" -> users  |
+                     +--------------------+
+                                |
+                                v
+                     +--------------------+
+                     |      HANDLER       |
+                     |      users()       |
+                     +--------------------+
+                                |
+                                v
+                     +--------------------+
+                     |   HTTP RESPONSE    |
+                     |      200 OK        |
+                     +--------------------+
+                                |
+                           conn.Write()
+                                |
+                                v
+                              TCP
+                                |
+                                v
+                             Browser
 ```
 
 ---
 
-# Что мы реализовали сами
-
-В этом проекте вручную сделаны:
+# Слои
 
 ```text
-TCP listener
-TCP accept
-TCP read/write
-HTTP request parsing
-Router
-Handlers
-HTTP response generation
+Application
+    |
+    | Router
+    | Handler
+    |
+    v
+HTTP
+    |
+    | request / response format
+    |
+    v
+TCP
+    |
+    | byte stream
+    |
+    v
+Operating System
 ```
 
-В реальном Go приложении пакет:
-
-```go
-net/http
-```
-
-берёт большую часть TCP и HTTP логики на себя.
-
-Тогда разработчик обычно работает уже примерно на уровне:
+Коротко:
 
 ```text
-HTTP request
-     |
-     v
- router
-     |
-     v
- handler
+TCP       = соединение + передача байтов
+HTTP      = формат request/response
+Router    = выбор handler по path
+Handler   = код, который обрабатывает запрос
 ```
-
-Именно это и является следующим логичным шагом после этого проекта.
