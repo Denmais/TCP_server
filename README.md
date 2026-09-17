@@ -1,651 +1,465 @@
-# Mini TCP/HTTP Server in Go
+# Concurrent TCP/HTTP Server: Python Threads and Go Goroutines
 
-Схема проекта:
-
-```text
-TCP -> HTTP -> Router -> Handler -> HTTP Response -> TCP
-```
-
-## Структура
+## Общая схема
 
 ```text
-mini-http/
-├── server.go
-└── README.md
+Client A ----\
+              \
+               -> TCP server -> HTTP parser -> Router -> Handler
+              /
+Client B ----/
 ```
 
-## 1. Запуск сервера
+Задача сервера: принимать несколько TCP-соединений так, чтобы один медленный клиент не блокировал остальных.
 
-```bash
-go run server.go
-```
+---
 
-Сервер слушает:
+# 1. Последовательная обработка
 
-```text
-127.0.0.1:8080
-```
+Базовый сервер:
 
-```go
-listener, err := net.Listen("tcp", "127.0.0.1:8080")
+```python
+while True:
+    conn, addr = server.accept()
+    handle_client(conn, addr)
 ```
 
 Схема:
 
 ```text
-server.go
+Client A
    |
    v
-net.Listen(...)
+accept()
    |
    v
-TCP listening socket
+handle A
    |
    v
-127.0.0.1:8080
-```
-
-`listener` принимает новые TCP-соединения:
-
-```go
-conn, err := listener.Accept()
-```
-
----
-
-## 2. Подключение пользователя
-
-Пользователь открывает:
-
-```text
-http://127.0.0.1:8080/users
-```
-
-Браузер создаёт TCP-соединение:
-
-```text
-User / Browser
-      |
-      | TCP connect
-      v
-127.0.0.1:8080
-      |
-      v
-listener.Accept()
-      |
-      v
-    conn
-```
-
-`conn` — TCP-соединение с конкретным клиентом.
-
----
-
-## 3. HTTP внутри TCP
-
-Браузер формирует HTTP-запрос:
-
-```http
-GET /users HTTP/1.1
-Host: 127.0.0.1:8080
-User-Agent: Mozilla/5.0 ...
-Accept: text/html
-Connection: keep-alive
-```
-
-HTTP передаётся через TCP как последовательность байтов:
-
-```text
-Browser
+finish A
    |
-   | TCP connection
-   |
-   | bytes
    v
-Server
+accept()
+   |
+   v
+handle B
 ```
 
-TCP не знает про:
-
-```text
-GET
-POST
-/users
-headers
-JSON
-status codes
-```
-
-Для TCP это только поток байтов.
+Пока `handle A` не завершится, сервер не начнёт обработку следующего клиента.
 
 ---
 
-## 4. Чтение данных
+# 2. Python: отдельный thread на клиента
 
-```go
-buffer := make([]byte, 4096)
+```python
+while True:
+    conn, addr = server.accept()
 
-n, err := conn.Read(buffer)
-```
+    thread = threading.Thread(
+        target=handle_client,
+        args=(conn, addr),
+    )
 
-`buffer` — массив байтов.
-
-Например начало запроса:
-
-```text
-index       byte       symbol
-
-buffer[0]    71          G
-buffer[1]    69          E
-buffer[2]    84          T
-buffer[3]    32        space
-buffer[4]    47          /
-```
-
-`n` — количество байтов, реально прочитанных этим вызовом `Read`.
-
-```go
-data := string(buffer[:n])
-```
-
-Преобразует полученные байты в строку:
-
-```text
-GET /users HTTP/1.1
-Host: 127.0.0.1:8080
-...
-```
-
----
-
-## 5. Разбор HTTP request line
-
-Первая строка:
-
-```text
-GET /users HTTP/1.1
-```
-
-Разбор:
-
-```go
-firstLine := strings.Split(data, "\r\n")[0]
-parts := strings.Split(firstLine, " ")
-
-method := parts[0]
-path := parts[1]
-protocol := parts[2]
-```
-
-Результат:
-
-```text
-method   = GET
-path     = /users
-protocol = HTTP/1.1
-```
-
----
-
-## 6. Router
-
-```go
-routes := map[string]func() string{
-    "/":      home,
-    "/users": users,
-}
-```
-
-По `path` выбирается handler:
-
-```go
-handler, exists := routes[path]
+    thread.start()
 ```
 
 Схема:
 
 ```text
-GET /users HTTP/1.1
-        |
-        v
- path = "/users"
-        |
-        v
-      router
-        |
-        v
- routes["/users"]
-        |
-        v
-     users()
+                    main thread
+                        |
+                     accept()
+                        |
+             +----------+----------+
+             |                     |
+             v                     v
+         thread A              thread B
+             |                     |
+         Client A              Client B
+             |                     |
+          recv()                  recv()
+             |                     |
+         handler()              handler()
+             |                     |
+          send()                  send()
 ```
+
+Главный поток в основном снова возвращается к `accept()`.
 
 ---
 
-## 7. Handler
+# 3. Пример с двумя клиентами
 
-```go
-func users() string {
+Пусть:
+
+```python
+def home():
+    time.sleep(5)
+    return "home page"
+
+def users():
     return "users page"
-}
 ```
 
-Handler возвращает данные для ответа:
+Клиент A открывает `/`, затем клиент B открывает `/users`.
 
 ```text
-users()
-   |
-   v
-"users page"
-```
+time ------------------------------------------------->
 
----
-
-## 8. HTTP response
-
-Сервер формирует ответ:
-
-```http
-HTTP/1.1 200 OK
-Content-Type: text/plain
-Content-Length: 10
-Connection: close
-
-users page
-```
-
-Отправка:
-
-```go
-conn.Write([]byte(response))
-```
-
-Схема:
-
-```text
-handler
-   |
-   v
-response string
-   |
-   v
-[]byte
-   |
-   v
-conn.Write(...)
-   |
-   | TCP
-   v
-Browser
-```
-
----
-
-# Два пользователя
-
-Пользователи подключаются в разное время и выполняют действия последовательно.
-
-## Пользователь A
-
-Открывает:
-
-```text
-/
-```
-
-```text
-User A
-  |
-  | TCP A
-  v
-Accept()
-  |
-  v
+thread A:
 GET /
-  |
-  v
-router
-  |
-  v
-home()
-  |
-  v
-200 OK
-  |
-  v
-conn.Close()
+sleep 5 sec
+---------------------------------> response
+
+thread B:
+        GET /users
+        response
+        close
+```
+
+Клиент B завершится раньше, хотя подключился позже.
+
+Пример лога:
+
+```text
+connected: ('127.0.0.1', 50004)
+('127.0.0.1', 50004) GET /
+
+connected: ('127.0.0.1', 50016)
+('127.0.0.1', 50016) GET /users
+
+closed: ('127.0.0.1', 50016)
+closed: ('127.0.0.1', 50004)
 ```
 
 ---
 
-## Пользователь B
+# 4. Один CPU core
 
-После этого пользователь B открывает:
+Если у машины одно ядро, потоки не исполняют Python-код физически одновременно.
+
+ОС переключается между ними:
 
 ```text
-/users
+CPU core
+
+thread A ---> thread B ---> thread A ---> thread B
 ```
 
+Если один поток ждёт:
+
+```python
+conn.recv(...)
+```
+
+или:
+
+```python
+time.sleep(...)
+```
+
+другой поток может продолжить работу.
+
+---
+
+# 5. Python thread и OS thread
+
+При использовании:
+
+```python
+threading.Thread(...)
+```
+
+создаётся системный поток.
+
 ```text
-User B
-  |
-  | TCP B
-  v
-Accept()
-  |
-  v
-GET /users
-  |
-  v
-router
-  |
-  v
-users()
-  |
-  v
-200 OK
-  |
-  v
-conn.Close()
+Python application
+
+main thread ---------> OS thread
+worker thread A -----> OS thread
+worker thread B -----> OS thread
+worker thread C -----> OS thread
 ```
 
 ---
 
-## Пользователь A делает ещё один запрос
+# 6. Go: goroutine на клиента
 
-Позже пользователь A открывает:
-
-```text
-/users
-```
-
-Если предыдущее TCP-соединение было закрыто, создаётся новое:
-
-```text
-User A
-   |
-   +---- TCP A ---- GET /
-   |
-   +---- TCP C ---- GET /users
-
-User B
-   |
-   +---- TCP B ---- GET /users
-```
-
-Один пользователь не равен одному TCP-соединению.
-
----
-
-# Последовательная обработка
-
-При таком коде:
+В Go:
 
 ```go
 for {
-    conn, _ := listener.Accept()
+    conn, err := listener.Accept()
+    if err != nil {
+        continue
+    }
 
-    // read
-    // parse HTTP
-    // route
-    // handler
-    // response
-
-    conn.Close()
+    go handleClient(conn)
 }
 ```
 
-сервер обрабатывает соединения последовательно.
+Ключевая строка:
 
-```text
-time ------------------------------------------------------>
-
-User A:
-    connect
-       |
-       +------ request A ------+
-                               |
-                            response
-
-Server:
-    Accept A
-       |
-       read
-       |
-       parse
-       |
-       route
-       |
-       handler
-       |
-       response
-       |
-       close A
-                               |
-                               +---- Accept B
-
-User B:
-                               connect
-                                  |
-                                  +---- request B ----+
+```go
+go handleClient(conn)
 ```
 
-Следующее TCP-соединение может ждать в очереди, пока сервер занят текущим.
+Без `go`:
+
+```go
+handleClient(conn)
+```
+
+текущая goroutine ждёт завершения функции.
+
+С `go`:
+
+```go
+go handleClient(conn)
+```
+
+создаётся новая goroutine, а текущая продолжает выполнение.
 
 ---
 
-# POST больше 4096 байт
+# 7. Схема Go-сервера
 
-```go
-buffer := make([]byte, 4096)
+```text
+                    main goroutine
+                         |
+                      Accept()
+                         |
+              +----------+----------+
+              |                     |
+              v                     v
+         goroutine A           goroutine B
+              |                     |
+           Client A              Client B
+              |                     |
+           Read()                  Read()
+              |                     |
+         handler()              handler()
+              |                     |
+          Write()                 Write()
 ```
 
-`4096` — размер одного буфера чтения.
+---
 
-Он не ограничивает размер HTTP-запроса.
+# 8. Goroutine != OS thread
+
+Goroutine — не системный поток.
+
+Это лёгкая единица выполнения, которой управляет Go runtime.
+
+```text
+goroutine A ----\
+goroutine B -----\
+goroutine C ------> Go runtime scheduler ---> OS thread 1
+goroutine D -----/                         ---> OS thread 2
+goroutine E ----/
+```
+
+Go runtime решает:
+
+```text
+какую goroutine
+когда
+на каком OS thread
+выполнять
+```
+
+---
+
+# 9. Если goroutine ждёт сеть
 
 Например:
 
-```http
-POST /users HTTP/1.1
-Content-Length: 10000
-
-<10000 bytes body>
+```go
+n, err := conn.Read(buffer)
 ```
 
-Данные могут быть прочитаны частями:
+Если данных пока нет, эта goroutine ждёт.
+
+Go runtime может выполнять другие goroutine.
 
 ```text
-TCP stream
+goroutine A
+   |
+   v
+conn.Read()
+   |
+   | waiting for network
+   |
+   +----------------------+
 
-[ 4096 bytes ]
-       |
-       v
-    Read #1
-
-[ 4096 bytes ]
-       |
-       v
-    Read #2
-
-[ remaining bytes ]
-       |
-       v
-    Read #3
+goroutine B
+             |
+             v
+          handler()
+             |
+             v
+          response
 ```
 
-Один `Read()` может вернуть любое количество доступных байтов:
+Код остаётся синхронным:
 
-```text
-120
-700
-4096
-38
-...
+```go
+conn.Read(...)
+time.Sleep(...)
+conn.Write(...)
 ```
 
-Границы `Read()` не совпадают с границами HTTP-запроса.
+Конкурентностью управляет runtime.
 
 ---
 
-# Чтение полного HTTP-запроса
+# 10. Python threads vs Go goroutines
 
-Сначала нужно найти конец headers:
-
-```text
-\r\n\r\n
-```
-
-Пример:
-
-```http
-POST /users HTTP/1.1
-Host: localhost
-Content-Type: application/json
-Content-Length: 16
-
-{"name":"Alex"}
-```
-
-Схема:
+Python:
 
 ```text
-POST /users HTTP/1.1\r\n
-Host: localhost\r\n
-Content-Type: application/json\r\n
-Content-Length: 16\r\n
-\r\n
-{"name":"Alex"}
-|-----------------------------------------------|
-                    headers
-
-                                                |--------------|
-                                                      body
+Client A ---> thread A ---> OS thread
+Client B ---> thread B ---> OS thread
+Client C ---> thread C ---> OS thread
 ```
 
-Алгоритм:
+Go:
 
 ```text
-1. Читать TCP
-        |
-        v
-2. Накапливать bytes
-        |
-        v
-3. Найти \r\n\r\n
-        |
-        v
-4. Распарсить headers
-        |
-        v
-5. Прочитать Content-Length
-        |
-        v
-6. Дочитать body до нужной длины
-        |
-        v
-7. Передать request router'у
-```
-
----
-
-# Общая схема
-
-```text
-                   USER A                 USER B
-                  Browser                Browser
-                     |                      |
-                     | TCP                  | TCP
-                     |                      |
-                     +----------+-----------+
-                                |
-                                v
-                     +--------------------+
-                     |   TCP LISTENER     |
-                     |  127.0.0.1:8080    |
-                     +--------------------+
-                                |
-                         listener.Accept()
-                                |
-                                v
-                     +--------------------+
-                     | TCP CONNECTION     |
-                     |       conn         |
-                     +--------------------+
-                                |
-                           conn.Read()
-                                |
-                                v
-                     +--------------------+
-                     |     RAW BYTES      |
-                     +--------------------+
-                                |
-                                v
-                     +--------------------+
-                     |    HTTP PARSER     |
-                     |                    |
-                     | method = GET       |
-                     | path = /users      |
-                     +--------------------+
-                                |
-                                v
-                     +--------------------+
-                     |      ROUTER        |
-                     |                    |
-                     | "/"      -> home   |
-                     | "/users" -> users  |
-                     +--------------------+
-                                |
-                                v
-                     +--------------------+
-                     |      HANDLER       |
-                     |      users()       |
-                     +--------------------+
-                                |
-                                v
-                     +--------------------+
-                     |   HTTP RESPONSE    |
-                     |      200 OK        |
-                     +--------------------+
-                                |
-                           conn.Write()
-                                |
-                                v
-                              TCP
-                                |
-                                v
-                             Browser
-```
-
----
-
-# Слои
-
-```text
-Application
-    |
-    | Router
-    | Handler
-    |
-    v
-HTTP
-    |
-    | request / response format
-    |
-    v
-TCP
-    |
-    | byte stream
-    |
-    v
-Operating System
+Client A ---> goroutine A --\
+Client B ---> goroutine B ----> Go runtime ---> OS threads
+Client C ---> goroutine C --/
 ```
 
 Коротко:
 
 ```text
-TCP       = соединение + передача байтов
-HTTP      = формат request/response
-Router    = выбор handler по path
-Handler   = код, который обрабатывает запрос
+Python threading:
+один worker = OS thread
+
+Go:
+один worker = goroutine
+goroutine multiplexed на OS threads
 ```
+
+---
+
+# 11. Где TCP и где HTTP
+
+Модель конкурентности не меняет TCP или HTTP.
+
+```text
+TCP connection
+      |
+      v
+Read / recv
+      |
+      v
+raw bytes
+      |
+      v
+HTTP parser
+      |
+      v
+method + path + headers + body
+      |
+      v
+router
+      |
+      v
+handler
+      |
+      v
+HTTP response
+      |
+      v
+Write / send
+      |
+      v
+TCP connection
+```
+
+Threads и goroutines меняют только способ одновременной обработки нескольких соединений.
+
+---
+
+# 12. Полная схема
+
+```text
+                    CLIENT A
+                       |
+                       | TCP
+                       v
+                 +-------------+
+                 | connection A|
+                 +-------------+
+                       |
+                       |
+                       |                CLIENT B
+                       |                   |
+                       |                   | TCP
+                       |                   v
+                       |             +-------------+
+                       |             | connection B|
+                       |             +-------------+
+                       |                   |
+                       +---------+---------+
+                                 |
+                                 v
+                        +----------------+
+                        | TCP LISTENER   |
+                        +----------------+
+                                 |
+                              Accept()
+                                 |
+              +------------------+------------------+
+              |                                     |
+              v                                     v
+        worker A                               worker B
+   thread / goroutine                     thread / goroutine
+              |                                     |
+              v                                     v
+          HTTP parse                            HTTP parse
+              |                                     |
+              v                                     v
+            router                                router
+              |                                     |
+              v                                     v
+           handler A                             handler B
+              |                                     |
+              v                                     v
+         HTTP response                         HTTP response
+              |                                     |
+              v                                     v
+           TCP write                             TCP write
+```
+
+---
+
+# 13. Главное различие
+
+Python:
+
+```text
+threading.Thread(...)
+        |
+        v
+OS thread
+```
+
+Go:
+
+```text
+go function()
+      |
+      v
+goroutine
+      |
+      v
+Go runtime scheduler
+      |
+      v
+OS threads
+```
+
+TCP и HTTP остаются теми же.

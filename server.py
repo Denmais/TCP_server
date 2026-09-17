@@ -27,6 +27,7 @@ print(f"http://{HOST}:{PORT}")
 
 while True:
     conn, addr = server.accept()
+    print(addr)
 
     data = conn.recv(4096).decode()
     print(data)
