@@ -1,7 +1,5 @@
 # Mini TCP/HTTP Server in Go
 
-Учебный проект, чтобы понять связь:
-
 ```text
 TCP -> HTTP -> Router -> Handler -> HTTP Response -> TCP
 ```
